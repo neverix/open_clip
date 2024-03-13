@@ -19,6 +19,7 @@ from .pretrained import is_pretrained_cfg, get_pretrained_cfg, download_pretrain
     list_pretrained_tags_by_model, download_pretrained_from_hf
 from .transform import image_transform_v2, AugmentationCfg, PreprocessCfg, merge_preprocess_dict, merge_preprocess_kwargs
 from .tokenizer import HFTokenizer, SimpleTokenizer, DEFAULT_CONTEXT_LENGTH
+import accelerate
 
 HF_HUB_PREFIX = 'hf-hub:'
 _MODEL_CONFIG_PATHS = [Path(__file__).parent / f"model_configs/"]
@@ -125,7 +126,7 @@ def get_tokenizer(
 
 
 def load_state_dict(checkpoint_path: str, map_location='cpu'):
-    checkpoint = torch.load(checkpoint_path, map_location=map_location)
+    checkpoint = torch.load(checkpoint_path, map_location=map_location, mmap=True)
     if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
         state_dict = checkpoint['state_dict']
     elif isinstance(checkpoint, torch.jit.ScriptModule):
@@ -242,38 +243,17 @@ def create_model(
             model_cfg['text_cfg']['hf_model_pretrained'] = pretrained_hf and not pretrained
         custom_text = model_cfg.pop('custom_text', False) or force_custom_text or is_hf_model
 
-        model_cfg = dict(model_cfg, **model_kwargs)  # merge cfg dict w/ kwargs (kwargs overrides cfg)
-        if custom_text:
-            if "multimodal_cfg" in model_cfg:
-                model = CoCa(**model_cfg, cast_dtype=cast_dtype)
+        with accelerate.init_empty_weights():
+            model_cfg = dict(model_cfg, **model_kwargs)  # merge cfg dict w/ kwargs (kwargs overrides cfg)
+            if custom_text:
+                if "multimodal_cfg" in model_cfg:
+                    model = CoCa(**model_cfg, cast_dtype=cast_dtype)
+                else:
+                    model = CustomTextCLIP(**model_cfg, cast_dtype=cast_dtype)
             else:
-                model = CustomTextCLIP(**model_cfg, cast_dtype=cast_dtype)
-        else:
-            model = CLIP(**model_cfg, cast_dtype=cast_dtype)
+                model = CLIP(**model_cfg, cast_dtype=cast_dtype)
 
-        if precision in ("fp16", "bf16"):
-            dtype = torch.float16 if 'fp16' in precision else torch.bfloat16
-            # manual mixed precision that matches original OpenAI behaviour
-            if is_timm_model:
-                # FIXME this is a bit janky, create timm based model in low-precision and
-                # then cast only LayerNormFp32 instances back to float32 so they don't break.
-                # Why? The convert_weights_to_lp fn only works with native models.
-                model.to(device=device, dtype=dtype)
-                from .transformer import LayerNormFp32
-
-                def _convert_ln(m):
-                    if isinstance(m, LayerNormFp32):
-                        m.weight.data = m.weight.data.to(torch.float32)
-                        m.bias.data = m.bias.data.to(torch.float32)
-                model.apply(_convert_ln)
-            else:
-                model.to(device=device)
-                convert_weights_to_lp(model, dtype=dtype)
-        elif precision in ("pure_fp16", "pure_bf16"):
-            dtype = torch.float16 if 'fp16' in precision else torch.bfloat16
-            model.to(device=device, dtype=dtype)
-        else:
-            model.to(device=device)
+        model.to(device=device)
 
         pretrained_loaded = False
         if pretrained:
